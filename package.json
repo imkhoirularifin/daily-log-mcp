@@ -1,18 +1,20 @@
 {
   "name": "daily-log-mcp",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "MCP server for recording daily work tasks into a central inbox (SQLite), then syncing to Google Sheets",
   "type": "module",
   "engines": {
     "node": ">=22"
   },
   "bin": {
-    "daily-log-mcp": "./dist/index.js"
+    "daily-log-mcp": "./dist/index.js",
+    "daily-log-cli": "./dist/cli.js"
   },
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
+    "cli": "node dist/cli.js",
     "test": "vitest run",
     "test:watch": "vitest"
   },

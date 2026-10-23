@@ -3,24 +3,39 @@ import { createMcpExpressApp } from "@modelcontextprotocol/sdk/server/express.js
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import type { Server } from "node:http";
 import { requireApiKey } from "../src/auth.js";
+import { runBootstrap } from "../src/bootstrap.js";
 import { closeDb, initDb } from "../src/db.js";
 import { createMcpServer } from "../src/server.js";
 
 describe("HTTP auth + health", () => {
   let server: Server;
   let baseUrl: string;
-  const prevKey = process.env.MCP_API_KEY;
+  const prevEnv: Record<string, string | undefined> = {};
 
   beforeAll(async () => {
-    process.env.MCP_API_KEY = "test-key-one,test-key-two";
+    for (const k of [
+      "MCP_API_KEY",
+      "DAILY_LOG_MCP_KEY_ARIFIN",
+      "DAILY_LOG_MCP_KEY_DORI",
+      "DAILY_LOG_MCP_KEY_DOCUMIND_DEVOPS",
+      "MCP_BOOTSTRAP_KEYS",
+    ]) {
+      prevEnv[k] = process.env[k];
+      delete process.env[k];
+    }
+    process.env.DAILY_LOG_MCP_KEY_ARIFIN = "test-key-one";
+    process.env.DAILY_LOG_MCP_KEY_DORI = "test-key-two";
+
     initDb(":memory:");
+    runBootstrap();
 
     const app = createMcpExpressApp({ host: "127.0.0.1" });
     app.get("/health", (_req, res) => {
       res.status(200).json({ status: "ok" });
     });
     app.post("/mcp", requireApiKey, async (req, res) => {
-      const mcp = createMcpServer();
+      const actor = req.authUser!;
+      const mcp = createMcpServer(actor);
       const transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: undefined,
       });
@@ -45,8 +60,10 @@ describe("HTTP auth + health", () => {
       server.close((err) => (err ? reject(err) : resolve()));
     });
     closeDb();
-    if (prevKey === undefined) delete process.env.MCP_API_KEY;
-    else process.env.MCP_API_KEY = prevKey;
+    for (const [k, v] of Object.entries(prevEnv)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
   });
 
   it("GET /health is public", async () => {
@@ -93,7 +110,7 @@ describe("HTTP auth + health", () => {
     expect(bad.status).toBe(401);
   });
 
-  it("accepts /mcp with a valid key", async () => {
+  it("accepts /mcp with a bootstrapped key", async () => {
     const res = await fetch(`${baseUrl}/mcp`, {
       method: "POST",
       headers: {

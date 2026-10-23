@@ -5,7 +5,11 @@ services:
     ports:
       - "${PORT:-3000}:3000"
     environment:
-      MCP_API_KEY: ${MCP_API_KEY:?set MCP_API_KEY in .env or the environment}
+      DAILY_LOG_MCP_KEY_ARIFIN: ${DAILY_LOG_MCP_KEY_ARIFIN:-}
+      DAILY_LOG_MCP_KEY_DORI: ${DAILY_LOG_MCP_KEY_DORI:-}
+      DAILY_LOG_MCP_KEY_DOCUMIND_DEVOPS: ${DAILY_LOG_MCP_KEY_DOCUMIND_DEVOPS:-}
+      MCP_BOOTSTRAP_KEYS: ${MCP_BOOTSTRAP_KEYS:-}
+      MCP_API_KEY: ${MCP_API_KEY:-}
       DATABASE_PATH: /data/daily-log.db
       PORT: "3000"
       HOST: "0.0.0.0"

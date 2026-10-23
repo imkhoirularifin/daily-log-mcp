@@ -1,43 +1,76 @@
-import { describe, expect, it } from "vitest";
-import {
-  extractBearerToken,
-  getApiKeys,
-  isAuthorized,
-} from "../src/auth.js";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { extractBearerToken, requireApiKey } from "../src/auth.js";
+import { closeDb, initDb } from "../src/db.js";
+import { resolveAuthUser, revokeApiKey } from "../src/users.js";
+import { makeUser } from "./helpers.js";
+import type { Request, Response } from "express";
 
-describe("API key parsing", () => {
-  it("splits comma-separated keys and trims", () => {
-    const keys = getApiKeys(" alpha ,beta, gamma ");
-    expect(keys.has("alpha")).toBe(true);
-    expect(keys.has("beta")).toBe(true);
-    expect(keys.has("gamma")).toBe(true);
-    expect(keys.size).toBe(3);
-  });
-
-  it("returns empty set when unset", () => {
-    expect(getApiKeys("").size).toBe(0);
-    expect(getApiKeys(undefined).size).toBe(0);
-  });
-});
-
-describe("Bearer auth", () => {
-  const keys = getApiKeys("secret-a,secret-b");
-
-  it("accepts a matching Bearer token", () => {
-    expect(isAuthorized("Bearer secret-a", keys)).toBe(true);
-    expect(isAuthorized("bearer secret-b", keys)).toBe(true);
-  });
-
-  it("rejects missing, malformed, or wrong tokens", () => {
-    expect(isAuthorized(undefined, keys)).toBe(false);
-    expect(isAuthorized("", keys)).toBe(false);
-    expect(isAuthorized("Basic secret-a", keys)).toBe(false);
-    expect(isAuthorized("Bearer wrong", keys)).toBe(false);
-    expect(isAuthorized("Bearer secret-a", getApiKeys(""))).toBe(false);
-  });
-
+describe("Bearer token extraction", () => {
   it("extracts token text", () => {
     expect(extractBearerToken("Bearer abc")).toBe("abc");
     expect(extractBearerToken("Token abc")).toBeNull();
+    expect(extractBearerToken(undefined)).toBeNull();
+  });
+});
+
+describe("key → user resolution", () => {
+  beforeEach(() => {
+    initDb(":memory:");
+  });
+  afterEach(() => {
+    closeDb();
+  });
+
+  it("resolves a Bearer key to the linked user", () => {
+    const { actor, rawKey } = makeUser({
+      nama: "Alza",
+      role: "Frontend",
+      rawKey: "alza-secret-key",
+    });
+    const resolved = resolveAuthUser(rawKey);
+    expect(resolved).toMatchObject({
+      id: actor.id,
+      nama: "Alza",
+      role: "Frontend",
+      isAdmin: false,
+      apiKeyId: actor.apiKeyId,
+    });
+  });
+
+  it("rejects unknown or revoked keys", () => {
+    const { actor, rawKey } = makeUser({
+      nama: "Temp",
+      role: "Backend",
+      rawKey: "will-revoke",
+    });
+    expect(resolveAuthUser("nope")).toBeNull();
+    revokeApiKey(actor.apiKeyId);
+    expect(resolveAuthUser(rawKey)).toBeNull();
+  });
+
+  it("requireApiKey attaches authUser", () => {
+    const { rawKey } = makeUser({
+      nama: "Dori",
+      role: "Sync",
+      isAdmin: true,
+      rawKey: "dori-key",
+    });
+    const req = {
+      header: (name: string) =>
+        name.toLowerCase() === "authorization" ? `Bearer ${rawKey}` : undefined,
+    } as unknown as Request;
+    const res = {
+      status: (code: number) => {
+        expect(code).toBe(401);
+        return { json: () => undefined };
+      },
+    } as unknown as Response;
+    let nextCalled = false;
+    requireApiKey(req, res, () => {
+      nextCalled = true;
+    });
+    expect(nextCalled).toBe(true);
+    expect(req.authUser?.nama).toBe("Dori");
+    expect(req.authUser?.isAdmin).toBe(true);
   });
 });
