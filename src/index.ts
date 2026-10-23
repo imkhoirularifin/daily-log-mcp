@@ -1,27 +1,21 @@
 #!/usr/bin/env node
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { createMcpExpressApp } from "@modelcontextprotocol/sdk/server/express.js";
-import { requireApiKey, getApiKeys } from "./auth.js";
+import { requireApiKey } from "./auth.js";
+import { ensureAuthConfigured, runBootstrap } from "./bootstrap.js";
 import { closeDb, getDatabasePath, initDb } from "./db.js";
 import { createMcpServer } from "./server.js";
 
 const PORT = Number(process.env.PORT || 3000);
 const HOST = process.env.HOST || "0.0.0.0";
 
-function ensureApiKeysConfigured(): void {
-  if (getApiKeys().size === 0) {
-    console.error(
-      "FATAL: MCP_API_KEY is not set. Set one or more comma-separated Bearer tokens.",
-    );
-    process.exit(1);
-  }
-}
-
 function main(): void {
-  ensureApiKeysConfigured();
   const dbPath = getDatabasePath();
   initDb(dbPath);
   console.log(`SQLite ready at ${dbPath}`);
+
+  const bootstrap = runBootstrap();
+  ensureAuthConfigured(bootstrap);
 
   // Bind 0.0.0.0 for Docker/Coolify; skip localhost-only DNS rebinding defaults.
   const app = createMcpExpressApp({ host: HOST });
@@ -31,7 +25,12 @@ function main(): void {
   });
 
   app.post("/mcp", requireApiKey, async (req, res) => {
-    const server = createMcpServer();
+    const actor = req.authUser;
+    if (!actor) {
+      res.status(401).json({ error: "unauthorized" });
+      return;
+    }
+    const server = createMcpServer(actor);
     try {
       const transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: undefined,

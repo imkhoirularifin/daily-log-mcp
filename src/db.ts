@@ -3,8 +3,10 @@ import { dirname } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { randomUUID } from "node:crypto";
 import {
-  FIXED_SHEET_VALUES,
+  FIXED_YESTERDAY,
+  LEGACY_DEFAULT_USER,
   type AddTaskInput,
+  type AuthUser,
   type Difficulty,
   type TaskOutput,
   type TaskRow,
@@ -17,6 +19,10 @@ export interface ListFilters {
   to?: string; // ISO
   synced?: boolean;
   sumber?: string;
+  /** Admin-only: filter by user nama (case-insensitive). */
+  nama_anggota?: string;
+  /** Admin-only: filter by user id. */
+  user_id?: string;
 }
 
 export interface AddResult {
@@ -26,7 +32,7 @@ export interface AddResult {
 
 let db: DatabaseSync | null = null;
 
-const MIGRATION_SQL = `
+const BASE_TASKS_SQL = `
 CREATE TABLE IF NOT EXISTS tasks (
   id TEXT PRIMARY KEY NOT NULL,
   tanggal TEXT NOT NULL,
@@ -50,6 +56,87 @@ CREATE INDEX IF NOT EXISTS idx_tasks_sumber ON tasks(sumber);
 CREATE INDEX IF NOT EXISTS idx_tasks_tanggal_task ON tasks(tanggal, task);
 `;
 
+const USERS_SQL = `
+CREATE TABLE IF NOT EXISTS users (
+  id TEXT PRIMARY KEY NOT NULL,
+  nama TEXT NOT NULL UNIQUE COLLATE NOCASE,
+  role TEXT NOT NULL,
+  is_admin INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS api_keys (
+  id TEXT PRIMARY KEY NOT NULL,
+  user_id TEXT NOT NULL REFERENCES users(id),
+  key_hash TEXT NOT NULL UNIQUE,
+  label TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  revoked_at TEXT,
+  last_used_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_api_keys_user_id ON api_keys(user_id);
+CREATE INDEX IF NOT EXISTS idx_api_keys_key_hash ON api_keys(key_hash);
+`;
+
+function tableColumns(database: DatabaseSync, table: string): Set<string> {
+  const rows = database
+    .prepare(`PRAGMA table_info(${table})`)
+    .all() as unknown as Array<{ name: string }>;
+  return new Set(rows.map((r) => r.name));
+}
+
+function nowIso(): string {
+  return new Date().toISOString();
+}
+
+/** Ensure legacy Arifin user exists; return its id. Idempotent. */
+export function ensureLegacyDefaultUserId(database: DatabaseSync): string {
+  const existing = database
+    .prepare("SELECT id FROM users WHERE lower(nama) = lower(?) LIMIT 1")
+    .get(LEGACY_DEFAULT_USER.nama) as { id: string } | undefined;
+  if (existing) return existing.id;
+
+  const id = randomUUID();
+  database
+    .prepare(
+      `INSERT INTO users (id, nama, role, is_admin, created_at)
+       VALUES (?, ?, ?, ?, ?)`,
+    )
+    .run(
+      id,
+      LEGACY_DEFAULT_USER.nama,
+      LEGACY_DEFAULT_USER.role,
+      LEGACY_DEFAULT_USER.isAdmin ? 1 : 0,
+      nowIso(),
+    );
+  return id;
+}
+
+/**
+ * Idempotent schema migrations:
+ * - users + api_keys tables
+ * - tasks.user_id column + backfill to Arifin
+ */
+export function migrateSchema(database: DatabaseSync): void {
+  database.exec(BASE_TASKS_SQL);
+  database.exec(USERS_SQL);
+
+  const cols = tableColumns(database, "tasks");
+  if (!cols.has("user_id")) {
+    database.exec("ALTER TABLE tasks ADD COLUMN user_id TEXT");
+  }
+
+  const arifinId = ensureLegacyDefaultUserId(database);
+  database
+    .prepare("UPDATE tasks SET user_id = ? WHERE user_id IS NULL OR user_id = ''")
+    .run(arifinId);
+
+  database.exec(
+    "CREATE INDEX IF NOT EXISTS idx_tasks_user_id ON tasks(user_id)",
+  );
+}
+
 export function getDatabasePath(): string {
   return process.env.DATABASE_PATH?.trim() || "/data/daily-log.db";
 }
@@ -61,7 +148,7 @@ export function openDatabase(path = getDatabasePath()): DatabaseSync {
   const database = new DatabaseSync(path);
   database.exec("PRAGMA journal_mode = WAL;");
   database.exec("PRAGMA foreign_keys = ON;");
-  database.exec(MIGRATION_SQL);
+  migrateSchema(database);
   return database;
 }
 
@@ -88,13 +175,12 @@ export function closeDb(): void {
   }
 }
 
-function nowIso(): string {
-  return new Date().toISOString();
-}
+type TaskJoinRow = TaskRow & { nama_anggota: string; user_role: string };
 
-function rowToOutput(row: TaskRow): TaskOutput {
+function rowToOutput(row: TaskJoinRow): TaskOutput {
   return {
     id: row.id,
+    user_id: row.user_id,
     tanggal: toDisplayDate(row.tanggal),
     task: row.task,
     tingkat_kesulitan: row.tingkat_kesulitan,
@@ -108,27 +194,48 @@ function rowToOutput(row: TaskRow): TaskOutput {
     synced_at: row.synced_at,
     created_at: row.created_at,
     updated_at: row.updated_at,
-    nama_anggota: FIXED_SHEET_VALUES.nama_anggota,
-    role: FIXED_SHEET_VALUES.role,
-    yesterday: FIXED_SHEET_VALUES.yesterday,
+    nama_anggota: row.nama_anggota,
+    role: row.user_role,
+    yesterday: FIXED_YESTERDAY,
   };
 }
 
-function getTaskById(id: string): TaskRow | undefined {
-  const row = getDb().prepare("SELECT * FROM tasks WHERE id = ?").get(id);
-  return row as unknown as TaskRow | undefined;
+const TASK_SELECT = `
+  SELECT t.*, u.nama AS nama_anggota, u.role AS user_role
+  FROM tasks t
+  JOIN users u ON u.id = t.user_id
+`;
+
+function getTaskById(id: string): TaskJoinRow | undefined {
+  const row = getDb()
+    .prepare(`${TASK_SELECT} WHERE t.id = ?`)
+    .get(id);
+  return row as unknown as TaskJoinRow | undefined;
 }
 
-function findDuplicate(tanggalIso: string, taskText: string): TaskRow | undefined {
+function findDuplicate(
+  userId: string,
+  tanggalIso: string,
+  taskText: string,
+): TaskJoinRow | undefined {
   const row = getDb()
     .prepare(
-      "SELECT * FROM tasks WHERE tanggal = ? AND lower(task) = lower(?) LIMIT 1",
+      `${TASK_SELECT} WHERE t.user_id = ? AND t.tanggal = ? AND lower(t.task) = lower(?) LIMIT 1`,
     )
-    .get(tanggalIso, taskText);
-  return row as unknown as TaskRow | undefined;
+    .get(userId, tanggalIso, taskText);
+  return row as unknown as TaskJoinRow | undefined;
 }
 
-export function addTask(input: AddTaskInput): AddResult {
+function assertCanAccessTask(actor: AuthUser, row: TaskJoinRow): void {
+  if (actor.isAdmin) return;
+  if (row.user_id !== actor.id) {
+    throw new ValidationError(
+      `Task tidak ditemukan atau bukan milik Anda: id=${row.id}`,
+    );
+  }
+}
+
+export function addTask(input: AddTaskInput, actor: AuthUser): AddResult {
   const id = randomUUID();
   const ts = nowIso();
   const beban = mapWorkload(input.tingkat_kesulitan);
@@ -137,7 +244,7 @@ export function addTask(input: AddTaskInput): AddResult {
   const tiket_url = input.tiket_url ?? "-";
   const blocker = input.blocker ?? "-";
 
-  const dup = findDuplicate(input.tanggal, input.task);
+  const dup = findDuplicate(actor.id, input.tanggal, input.task);
   const duplicateWarning = dup
     ? `Peringatan: kemungkinan duplikat — sudah ada task dengan tanggal yang sama dan teks task yang sama (id=${dup.id}). Task tetap disimpan.`
     : undefined;
@@ -145,12 +252,13 @@ export function addTask(input: AddTaskInput): AddResult {
   getDb()
     .prepare(
       `INSERT INTO tasks (
-        id, tanggal, task, tingkat_kesulitan, beban_kerja, progress, status,
+        id, user_id, tanggal, task, tingkat_kesulitan, beban_kerja, progress, status,
         tiket_url, blocker, sumber, synced, synced_at, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, ?, ?)`,
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, ?, ?)`,
     )
     .run(
       id,
+      actor.id,
       input.tanggal,
       input.task,
       input.tingkat_kesulitan,
@@ -171,7 +279,10 @@ export function addTask(input: AddTaskInput): AddResult {
   return { task: rowToOutput(row), duplicateWarning };
 }
 
-export function addTasks(inputs: AddTaskInput[]): {
+export function addTasks(
+  inputs: AddTaskInput[],
+  actor: AuthUser,
+): {
   tasks: TaskOutput[];
   warnings: string[];
 } {
@@ -190,7 +301,7 @@ export function addTasks(inputs: AddTaskInput[]): {
   database.exec("BEGIN");
   try {
     for (const input of inputs) {
-      const result = addTask(input);
+      const result = addTask(input, actor);
       tasks.push(result.task);
       if (result.duplicateWarning) {
         warnings.push(`[${result.task.id}] ${result.duplicateWarning}`);
@@ -204,33 +315,50 @@ export function addTasks(inputs: AddTaskInput[]): {
   return { tasks, warnings };
 }
 
-export function listTasks(filters: ListFilters = {}): TaskOutput[] {
+export function listTasks(
+  filters: ListFilters = {},
+  actor: AuthUser,
+): TaskOutput[] {
   const clauses: string[] = [];
   const params: (string | number)[] = [];
 
+  if (!actor.isAdmin) {
+    clauses.push("t.user_id = ?");
+    params.push(actor.id);
+  } else {
+    if (filters.user_id) {
+      clauses.push("t.user_id = ?");
+      params.push(filters.user_id);
+    }
+    if (filters.nama_anggota) {
+      clauses.push("lower(u.nama) = lower(?)");
+      params.push(filters.nama_anggota.trim());
+    }
+  }
+
   if (filters.from) {
-    clauses.push("tanggal >= ?");
+    clauses.push("t.tanggal >= ?");
     params.push(filters.from);
   }
   if (filters.to) {
-    clauses.push("tanggal <= ?");
+    clauses.push("t.tanggal <= ?");
     params.push(filters.to);
   }
   if (filters.synced !== undefined) {
-    clauses.push("synced = ?");
+    clauses.push("t.synced = ?");
     params.push(filters.synced ? 1 : 0);
   }
   if (filters.sumber) {
-    clauses.push("sumber = ?");
+    clauses.push("t.sumber = ?");
     params.push(filters.sumber);
   }
 
   const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
   const rows = getDb()
     .prepare(
-      `SELECT * FROM tasks ${where} ORDER BY tanggal ASC, created_at ASC`,
+      `${TASK_SELECT} ${where} ORDER BY t.tanggal ASC, t.created_at ASC`,
     )
-    .all(...params) as unknown as TaskRow[];
+    .all(...params) as unknown as TaskJoinRow[];
 
   return rows.map(rowToOutput);
 }
@@ -246,11 +374,16 @@ export interface UpdateTaskPatch {
   sumber?: string;
 }
 
-export function updateTask(id: string, patch: UpdateTaskPatch): TaskOutput {
+export function updateTask(
+  id: string,
+  patch: UpdateTaskPatch,
+  actor: AuthUser,
+): TaskOutput {
   const existing = getTaskById(id);
   if (!existing) {
     throw new ValidationError(`Task tidak ditemukan: id=${id}`);
   }
+  assertCanAccessTask(actor, existing);
   if (existing.synced === 1) {
     throw new ValidationError(
       `Task ${id} sudah di-sync ke Google Sheets (synced_at=${existing.synced_at}). Tidak bisa diubah. Tambahkan task baru jika perlu koreksi.`,
@@ -299,11 +432,15 @@ export function updateTask(id: string, patch: UpdateTaskPatch): TaskOutput {
   return rowToOutput(row);
 }
 
-export function deleteTask(id: string): { id: string; deleted: true } {
+export function deleteTask(
+  id: string,
+  actor: AuthUser,
+): { id: string; deleted: true } {
   const existing = getTaskById(id);
   if (!existing) {
     throw new ValidationError(`Task tidak ditemukan: id=${id}`);
   }
+  assertCanAccessTask(actor, existing);
   if (existing.synced === 1) {
     throw new ValidationError(
       `Task ${id} sudah di-sync. Tidak bisa dihapus dari inbox.`,
@@ -313,11 +450,19 @@ export function deleteTask(id: string): { id: string; deleted: true } {
   return { id, deleted: true };
 }
 
-export function markSynced(ids: string[]): {
+export function markSynced(
+  ids: string[],
+  actor: AuthUser,
+): {
   updated: TaskOutput[];
   notFound: string[];
   alreadySynced: string[];
 } {
+  if (!actor.isAdmin) {
+    throw new ValidationError(
+      "mark_synced hanya boleh dipanggil dengan API key admin (sheet-sync).",
+    );
+  }
   if (!ids.length) {
     throw new ValidationError("ids wajib diisi (minimal 1 id).");
   }

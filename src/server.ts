@@ -9,7 +9,7 @@ import {
   updateTask,
 } from "./db.js";
 import { getGuidelinesText } from "./guidelines.js";
-import { DIFFICULTY_LEVELS, TASK_STATUSES } from "./types.js";
+import { DIFFICULTY_LEVELS, TASK_STATUSES, type AuthUser } from "./types.js";
 import {
   optionalString,
   parseDifficulty,
@@ -69,10 +69,10 @@ function normalizeAddInput(raw: {
   };
 }
 
-export function createMcpServer(): McpServer {
+export function createMcpServer(actor: AuthUser): McpServer {
   const server = new McpServer({
     name: "daily-log-mcp",
-    version: "1.0.0",
+    version: "1.1.0",
   });
 
   server.registerTool(
@@ -80,7 +80,7 @@ export function createMcpServer(): McpServer {
     {
       title: "Get guidelines",
       description:
-        "Kembalikan pedoman pengisian daily log (aturan baris, format tanggal DD/MM/YYYY, mapping kesulitan→beban kerja, default progress/status/tiket/blocker, dan alur sync ke Google Sheets). Panggil ini sebelum menambah task jika belum familiar dengan aturan.",
+        "Kembalikan pedoman pengisian daily log (multi-user: identitas dari API key, aturan baris, format tanggal DD/MM/YYYY, mapping kesulitan→beban kerja, default progress/status/tiket/blocker, dan alur sync ke Google Sheets). Panggil ini sebelum menambah task jika belum familiar dengan aturan.",
       inputSchema: {},
     },
     async () => textResult({ guidelines: getGuidelinesText() }),
@@ -91,7 +91,7 @@ export function createMcpServer(): McpServer {
     {
       title: "Add single task",
       description:
-        "Tambah SATU task kerja harian Arifin (Backend) ke inbox. Wajib: tanggal (DD/MM/YYYY hari pekerjaan dikerjakan, min 17/09/2026), task (teks), tingkat_kesulitan (Sangat Mudah|Mudah|Sedang|Sulit|Sangat Sulit), sumber (nama AI). beban_kerja dihitung otomatis 1–5. Default: progress=100, status=Done, tiket_url=\"-\", blocker=\"-\". Jika tanggal+task sama dengan yang sudah ada, tetap disimpan dengan peringatan duplikat.",
+        "Tambah SATU task kerja harian ke inbox atas nama user pemilik API key (nama_anggota + role diisi otomatis; caller tidak bisa set). Wajib: tanggal (DD/MM/YYYY hari pekerjaan dikerjakan, min 17/09/2026), task (teks), tingkat_kesulitan (Sangat Mudah|Mudah|Sedang|Sulit|Sangat Sulit), sumber (nama AI). beban_kerja dihitung otomatis 1–5. Default: progress=100, status=Done, tiket_url=\"-\", blocker=\"-\". Jika tanggal+task sama milik user yang sama, tetap disimpan dengan peringatan duplikat.",
       inputSchema: {
         tanggal: z
           .string()
@@ -126,7 +126,7 @@ export function createMcpServer(): McpServer {
     async (args) => {
       try {
         const input = normalizeAddInput(args);
-        const result = addTask(input);
+        const result = addTask(input, actor);
         return textResult({
           ok: true,
           task: result.task,
@@ -143,7 +143,7 @@ export function createMcpServer(): McpServer {
     {
       title: "Add tasks (bulk)",
       description:
-        "Tambah banyak task sekaligus (maksimal 50). Setiap item mengikuti aturan add_task yang sama. Gunakan untuk mencatat beberapa pekerjaan dalam satu sesi.",
+        "Tambah banyak task sekaligus (maksimal 50) atas nama user pemilik API key. Setiap item mengikuti aturan add_task yang sama. Gunakan untuk mencatat beberapa pekerjaan dalam satu sesi.",
       inputSchema: {
         tasks: z
           .array(
@@ -166,7 +166,7 @@ export function createMcpServer(): McpServer {
     async ({ tasks }) => {
       try {
         const inputs = tasks.map((t) => normalizeAddInput(t));
-        const result = addTasks(inputs);
+        const result = addTasks(inputs, actor);
         return textResult({
           ok: true,
           count: result.tasks.length,
@@ -184,7 +184,7 @@ export function createMcpServer(): McpServer {
     {
       title: "List tasks",
       description:
-        "List task dari inbox, diurutkan tanggal lalu created_at. Filter opsional: from/to (DD/MM/YYYY), synced (true/false), sumber. Output sudah lengkap untuk baris sheet (nama_anggota=Arifin, role=Backend, yesterday=\"-\", beban_kerja). Untuk sync sheet, pakai synced=false.",
+        "List task dari inbox, diurutkan tanggal lalu created_at. Non-admin: hanya task sendiri. Admin: semua user; filter opsional nama_anggota. Filter lain: from/to (DD/MM/YYYY), synced (true/false), sumber. Output mencakup nama_anggota + role per task. Untuk sync sheet, pakai synced=false (dengan admin key).",
       inputSchema: {
         from: z
           .string()
@@ -199,6 +199,10 @@ export function createMcpServer(): McpServer {
           .optional()
           .describe("true = sudah sync, false = pending sync"),
         sumber: z.string().optional().describe("Filter sumber AI"),
+        nama_anggota: z
+          .string()
+          .optional()
+          .describe("Admin only: filter by user nama (e.g. Arifin, Alza)"),
       },
     },
     async (args) => {
@@ -208,8 +212,16 @@ export function createMcpServer(): McpServer {
           to: args.to ? parseDisplayDate(args.to) : undefined,
           synced: parseOptionalBool(args.synced),
           sumber: args.sumber ? requireNonEmptyString(args.sumber, "sumber") : undefined,
+          nama_anggota: args.nama_anggota
+            ? requireNonEmptyString(args.nama_anggota, "nama_anggota")
+            : undefined,
         };
-        const tasks = listTasks(filters);
+        if (filters.nama_anggota && !actor.isAdmin) {
+          throw new ValidationError(
+            "Filter nama_anggota hanya untuk API key admin.",
+          );
+        }
+        const tasks = listTasks(filters, actor);
         return textResult({ ok: true, count: tasks.length, tasks });
       } catch (err) {
         return handleError(err);
@@ -222,7 +234,7 @@ export function createMcpServer(): McpServer {
     {
       title: "Update task",
       description:
-        "Update field task yang BELUM di-sync. Task yang sudah synced ditolak. Field yang tidak dikirim tetap. beban_kerja dihitung ulang jika tingkat_kesulitan berubah.",
+        "Update field task yang BELUM di-sync dan milik Anda (non-admin) / siapa saja (admin). Task yang sudah synced ditolak. Field yang tidak dikirim tetap. beban_kerja dihitung ulang jika tingkat_kesulitan berubah. nama_anggota/role tidak bisa diubah lewat sini.",
       inputSchema: {
         id: z.string().describe("UUID task"),
         tanggal: z.string().optional().describe("DD/MM/YYYY"),
@@ -251,7 +263,7 @@ export function createMcpServer(): McpServer {
         if (args.sumber !== undefined) {
           patch.sumber = requireNonEmptyString(args.sumber, "sumber");
         }
-        const task = updateTask(id, patch);
+        const task = updateTask(id, patch, actor);
         return textResult({ ok: true, task });
       } catch (err) {
         return handleError(err);
@@ -264,14 +276,14 @@ export function createMcpServer(): McpServer {
     {
       title: "Delete task",
       description:
-        "Hapus task yang BELUM di-sync. Task yang sudah synced ditolak (sudah ada di sheet).",
+        "Hapus task yang BELUM di-sync dan milik Anda (non-admin) / siapa saja (admin). Task yang sudah synced ditolak (sudah ada di sheet).",
       inputSchema: {
         id: z.string().describe("UUID task yang akan dihapus"),
       },
     },
     async ({ id }) => {
       try {
-        const result = deleteTask(requireNonEmptyString(id, "id"));
+        const result = deleteTask(requireNonEmptyString(id, "id"), actor);
         return textResult({ ok: true, ...result });
       } catch (err) {
         return handleError(err);
@@ -284,7 +296,7 @@ export function createMcpServer(): McpServer {
     {
       title: "Mark tasks synced",
       description:
-        "Tandai daftar task sebagai sudah disalin ke Google Sheets (synced=true, set synced_at). Panggil SETELAH berhasil menulis baris ke sheet. Id yang tidak ditemukan dilaporkan di notFound; yang sudah synced sebelumnya di alreadySynced (idempotent).",
+        "Admin only. Tandai daftar task sebagai sudah disalin ke Google Sheets (synced=true, set synced_at). Panggil SETELAH berhasil menulis baris ke sheet. Id yang tidak ditemukan dilaporkan di notFound; yang sudah synced sebelumnya di alreadySynced (idempotent).",
       inputSchema: {
         ids: z
           .array(z.string())
@@ -294,7 +306,7 @@ export function createMcpServer(): McpServer {
     },
     async ({ ids }) => {
       try {
-        const result = markSynced(ids);
+        const result = markSynced(ids, actor);
         return textResult({
           ok: true,
           updated_count: result.updated.length,
