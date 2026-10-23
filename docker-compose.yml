@@ -1,0 +1,23 @@
+services:
+  daily-log-mcp:
+    build: .
+    image: daily-log-mcp:latest
+    ports:
+      - "${PORT:-3000}:3000"
+    environment:
+      MCP_API_KEY: ${MCP_API_KEY:?set MCP_API_KEY in .env or the environment}
+      DATABASE_PATH: /data/daily-log.db
+      PORT: "3000"
+      HOST: "0.0.0.0"
+    volumes:
+      - daily-log-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:3000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  daily-log-data:

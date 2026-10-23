@@ -1,0 +1,17 @@
+node_modules
+dist
+.git
+.gitignore
+.env
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+data
+coverage
+tests
+*.md
+.vscode
+.idea
+.DS_Store
+vitest.config.ts
