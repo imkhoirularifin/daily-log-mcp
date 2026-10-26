@@ -17,6 +17,7 @@ Small production MCP server that lets AI assistants (Claude, Cursor, ChatGPT, et
 | `list_tasks` | Own tasks (non-admin) or all users (admin); filter by date / synced / sumber / `nama_anggota` (admin) |
 | `update_task` | Edit only while `synced=false` (own tasks unless admin) |
 | `delete_task` | Delete only while `synced=false` (own tasks unless admin) |
+| `delete_unsynced_tasks` | Bulk delete unsynced tasks; filters `ids` / `from` / `to` / `sumber` / `nama_anggota` (admin); optional `dry_run`; partial success |
 | `mark_synced` | **Admin only** — mark ids as written to the sheet |
 
 Every list/add output includes `nama_anggota`, `role` (from the task owner), and `yesterday=-`. Dates use **DD/MM/YYYY**; storage is ISO. Earliest allowed date: **17/09/2026**.
@@ -177,7 +178,21 @@ Prefer an official MCP SDK client over raw curl for multi-step sessions. Auth wi
 ## Typical AI workflow
 
 1. Coding assistant (user key): `get_guidelines` → `add_task` / `add_tasks` with `sumber` set to its name.
-2. Sheet assistant (Dori admin key): `list_tasks` with `synced=false` (optionally `nama_anggota`) → write rows to Google Sheets → `mark_synced` with those ids.
+2. To drop mistaken unsynced rows: `delete_unsynced_tasks` with at least one of `ids`, `from`, `to`, `sumber` (or admin `nama_anggota`). Use `dry_run=true` first if unsure. Synced / not-owned ids are refused with reasons; eligible ones are deleted (partial success).
+3. Sheet assistant (Dori admin key): `list_tasks` with `synced=false` (optionally `nama_anggota`) → write rows to Google Sheets → `mark_synced` with those ids.
+
+### `delete_unsynced_tasks` parameters
+
+| Param | Required | Notes |
+|-------|----------|-------|
+| `ids` | one of these filters | Array of task UUIDs |
+| `from` | one of these filters | Start date `DD/MM/YYYY` (inclusive), same as `list_tasks` |
+| `to` | one of these filters | End date `DD/MM/YYYY` (inclusive) |
+| `sumber` | one of these filters | Exact AI/client name |
+| `nama_anggota` | one of these filters | Admin only; user `nama` |
+| `dry_run` | no | `true` = preview deleted/refused lists without DELETE |
+
+At least one filter among `ids` / `from` / `to` / `sumber` / `nama_anggota` is required (no accidental wipe-all). Same synced/ownership rules as `delete_task`.
 
 ## License
 

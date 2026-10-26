@@ -450,6 +450,172 @@ export function deleteTask(
   return { id, deleted: true };
 }
 
+export interface DeleteUnsyncedFilters {
+  /** Explicit task UUIDs to consider. */
+  ids?: string[];
+  from?: string; // ISO
+  to?: string; // ISO
+  sumber?: string;
+  /** Admin-only: filter by user nama (case-insensitive). */
+  nama_anggota?: string;
+  /** When true, report what would happen without deleting. */
+  dry_run?: boolean;
+}
+
+export interface DeleteUnsyncedRefused {
+  id: string;
+  reason: string;
+}
+
+export interface DeleteUnsyncedResult {
+  dry_run: boolean;
+  deleted_count: number;
+  deleted: TaskOutput[];
+  refused: DeleteUnsyncedRefused[];
+}
+
+function hasDeleteUnsyncedFilter(filters: DeleteUnsyncedFilters): boolean {
+  return Boolean(
+    (filters.ids && filters.ids.length > 0) ||
+      filters.from ||
+      filters.to ||
+      filters.sumber ||
+      filters.nama_anggota,
+  );
+}
+
+function taskMatchesRangeAndSumber(
+  row: TaskJoinRow,
+  filters: DeleteUnsyncedFilters,
+): boolean {
+  if (filters.from && row.tanggal < filters.from) return false;
+  if (filters.to && row.tanggal > filters.to) return false;
+  if (filters.sumber && row.sumber !== filters.sumber) return false;
+  if (
+    filters.nama_anggota &&
+    row.nama_anggota.toLowerCase() !== filters.nama_anggota.trim().toLowerCase()
+  ) {
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Bulk-delete unsynced tasks matching at least one filter.
+ * Partial success: eligible (synced=false + accessible) tasks are deleted;
+ * synced / missing / not-owned ids are reported in `refused` with reasons.
+ * Consistent with `delete_task` messages for synced and ownership failures.
+ */
+export function deleteUnsyncedTasks(
+  filters: DeleteUnsyncedFilters,
+  actor: AuthUser,
+): DeleteUnsyncedResult {
+  if (!hasDeleteUnsyncedFilter(filters)) {
+    throw new ValidationError(
+      "Minimal satu filter wajib: ids, from, to, sumber, atau nama_anggota. Tidak boleh menghapus semua task tanpa filter.",
+    );
+  }
+  if (filters.nama_anggota && !actor.isAdmin) {
+    throw new ValidationError(
+      "Filter nama_anggota hanya untuk API key admin.",
+    );
+  }
+
+  const dryRun = Boolean(filters.dry_run);
+  const deleted: TaskOutput[] = [];
+  const refused: DeleteUnsyncedRefused[] = [];
+  const seen = new Set<string>();
+
+  const consider = (row: TaskJoinRow | undefined, idHint: string): void => {
+    if (!row) {
+      refused.push({
+        id: idHint,
+        reason: `Task tidak ditemukan: id=${idHint}`,
+      });
+      return;
+    }
+    if (seen.has(row.id)) return;
+    seen.add(row.id);
+
+    if (!actor.isAdmin && row.user_id !== actor.id) {
+      refused.push({
+        id: row.id,
+        reason: `Task tidak ditemukan atau bukan milik Anda: id=${row.id}`,
+      });
+      return;
+    }
+    if (row.synced === 1) {
+      refused.push({
+        id: row.id,
+        reason: `Task ${row.id} sudah di-sync. Tidak bisa dihapus dari inbox.`,
+      });
+      return;
+    }
+
+    deleted.push(rowToOutput(row));
+  };
+
+  if (filters.ids && filters.ids.length > 0) {
+    const uniqueIds = [
+      ...new Set(filters.ids.map((i) => i.trim()).filter(Boolean)),
+    ];
+    if (!uniqueIds.length) {
+      throw new ValidationError(
+        "ids wajib berisi minimal 1 UUID non-kosong jika dikirim.",
+      );
+    }
+    for (const id of uniqueIds) {
+      const row = getTaskById(id);
+      if (row && !taskMatchesRangeAndSumber(row, filters)) {
+        refused.push({
+          id,
+          reason: `Task ${id} tidak cocok dengan filter from/to/sumber/nama_anggota yang dikirim.`,
+        });
+        continue;
+      }
+      consider(row, id);
+    }
+  } else {
+    // Same scoping/filter semantics as list_tasks (without synced filter),
+    // then refuse any synced matches so callers see why they were skipped.
+    const listed = listTasks(
+      {
+        from: filters.from,
+        to: filters.to,
+        sumber: filters.sumber,
+        nama_anggota: filters.nama_anggota,
+      },
+      actor,
+    );
+    for (const task of listed) {
+      const row = getTaskById(task.id);
+      consider(row, task.id);
+    }
+  }
+
+  if (!dryRun && deleted.length > 0) {
+    const database = getDb();
+    database.exec("BEGIN");
+    try {
+      const stmt = database.prepare("DELETE FROM tasks WHERE id = ?");
+      for (const task of deleted) {
+        stmt.run(task.id);
+      }
+      database.exec("COMMIT");
+    } catch (err) {
+      database.exec("ROLLBACK");
+      throw err;
+    }
+  }
+
+  return {
+    dry_run: dryRun,
+    deleted_count: deleted.length,
+    deleted,
+    refused,
+  };
+}
+
 export function markSynced(
   ids: string[],
   actor: AuthUser,
