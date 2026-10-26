@@ -4,6 +4,7 @@ import {
   addTask,
   addTasks,
   deleteTask,
+  deleteUnsyncedTasks,
   listTasks,
   markSynced,
   updateTask,
@@ -72,7 +73,7 @@ function normalizeAddInput(raw: {
 export function createMcpServer(actor: AuthUser): McpServer {
   const server = new McpServer({
     name: "daily-log-mcp",
-    version: "1.1.0",
+    version: "1.2.0",
   });
 
   server.registerTool(
@@ -285,6 +286,67 @@ export function createMcpServer(actor: AuthUser): McpServer {
       try {
         const result = deleteTask(requireNonEmptyString(id, "id"), actor);
         return textResult({ ok: true, ...result });
+      } catch (err) {
+        return handleError(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    "delete_unsynced_tasks",
+    {
+      title: "Delete unsynced tasks (bulk)",
+      description:
+        "Hapus banyak task yang BELUM di-sync (synced=false). Wajib minimal satu filter: ids, from, to, sumber, atau nama_anggota (admin). Non-admin hanya task sendiri; admin bisa semua user. Partial success: yang eligible dihapus, yang synced/bukan milik/tidak ditemukan dilaporkan di refused (alasan sama seperti delete_task). dry_run=true hanya melaporkan tanpa menghapus.",
+      inputSchema: {
+        ids: z
+          .array(z.string())
+          .min(1)
+          .optional()
+          .describe("Daftar UUID task yang akan dipertimbangkan"),
+        from: z
+          .string()
+          .optional()
+          .describe("Filter tanggal awal DD/MM/YYYY (inklusif)"),
+        to: z
+          .string()
+          .optional()
+          .describe("Filter tanggal akhir DD/MM/YYYY (inklusif)"),
+        sumber: z.string().optional().describe("Filter sumber AI"),
+        nama_anggota: z
+          .string()
+          .optional()
+          .describe("Admin only: filter by user nama (e.g. Arifin, Alza)"),
+        dry_run: z
+          .boolean()
+          .optional()
+          .describe(
+            "true = hanya hitung/list yang akan dihapus atau ditolak, tanpa DELETE",
+          ),
+      },
+    },
+    async (args) => {
+      try {
+        const filters = {
+          ids: args.ids?.map((id) => requireNonEmptyString(id, "ids[]")),
+          from: args.from ? parseDisplayDate(args.from) : undefined,
+          to: args.to ? parseDisplayDate(args.to) : undefined,
+          sumber: args.sumber
+            ? requireNonEmptyString(args.sumber, "sumber")
+            : undefined,
+          nama_anggota: args.nama_anggota
+            ? requireNonEmptyString(args.nama_anggota, "nama_anggota")
+            : undefined,
+          dry_run: parseOptionalBool(args.dry_run) ?? false,
+        };
+        const result = deleteUnsyncedTasks(filters, actor);
+        return textResult({
+          ok: true,
+          dry_run: result.dry_run,
+          deleted_count: result.deleted_count,
+          deleted: result.deleted,
+          refused: result.refused,
+        });
       } catch (err) {
         return handleError(err);
       }
